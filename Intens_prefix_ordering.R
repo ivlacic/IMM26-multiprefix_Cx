@@ -606,12 +606,30 @@ print(worth_df %>% select(Prefix, rank_worth, rank_ICTRANS,
 # consistent with 100% of attested pairs, the six prefixes occupy fixed
 # positions in a single global hierarchy.
 #
+# Three weighting schemes are compared:
+#   (a) Unweighted: every pair counts equally regardless of token count
+#       or preference strength.
+#   (b) Magnitude-weighted: pairs with stronger ordering preferences
+#       (|p - 0.5| closer to 0.5) contribute more. Reflects how
+#       informative each pair is about the underlying hierarchy.
+#   (c) Combined-weighted: magnitude × token count. Rewards both a
+#       strong preference and a reliable estimate of that preference.
+#       Closest in spirit to what a Bradley-Terry likelihood does.
+#
+# If all three schemes recover the same ranking, the total order is robust
+# to the choice of weighting.
+# ============================================================================
+
 # ----------------------------------------------------------------------------
 # 23. Build the dominance matrix
 # ----------------------------------------------------------------------------
 # Entry [i, j] = proportion of tokens where prefix i appears leftward
 # of prefix j. Built from pair_counts, which already contains the
 # direction-consistent ordering proportions.
+#
+# The matrix is antisymmetric by construction: if dom_matrix[i,j] = p,
+# then dom_matrix[j,i] = 1 - p. Diagonal entries are set to 0.5
+# (a prefix does not compete with itself).
 
 dom_matrix <- matrix(NA,
                      nrow = 6, ncol = 6,
@@ -639,7 +657,6 @@ for (i in seq_along(prefixes)) {
       next
     }
     
-    # Proportion of tokens where pi is leftward
     if (pair_row$prefix_A == pi) {
       dom_matrix[i, j] <- pair_row$prop_A_left
     } else {
@@ -651,12 +668,41 @@ for (i in seq_along(prefixes)) {
 cat("\n--- Dominance matrix (P(row prefix appears leftward)) ---\n")
 print(round(dom_matrix, 3))
 
+# Also build a token-count matrix for use in weighted analyses below
+# Entry [i, j] = number of tokens in the pair {i, j}
+
+token_matrix <- matrix(NA,
+                       nrow = 6, ncol = 6,
+                       dimnames = list(prefixes, prefixes))
+
+for (i in seq_along(prefixes)) {
+  for (j in seq_along(prefixes)) {
+    
+    if (i == j) {
+      token_matrix[i, j] <- 0
+      next
+    }
+    
+    pi <- prefixes[i]
+    pj <- prefixes[j]
+    
+    pair_row <- pair_counts %>%
+      filter(
+        (prefix_A == pi & prefix_B == pj) |
+          (prefix_A == pj & prefix_B == pi)
+      )
+    
+    token_matrix[i, j] <- if (nrow(pair_row) > 0) pair_row$n_total else NA
+  }
+}
+
 # ----------------------------------------------------------------------------
 # 24. Transitivity test across all 20 triples
 # ----------------------------------------------------------------------------
 # For each triple {A, B, C}, checks whether the three pairwise ordering
 # proportions are mutually consistent with some linear ordering of A, B, C.
-# A violation occurs when A > B and B > C but C > A (a Condorcet cycle).
+# A violation (Condorcet cycle) occurs when A > B and B > C but C > A,
+# making it impossible to rank the three consistently.
 
 triples <- combn(prefixes, 3, simplify = FALSE)
 
@@ -708,11 +754,12 @@ cat(sprintf(
 ))
 
 # ----------------------------------------------------------------------------
-# 25. Win-count ranking
+# 25. Win-count ranking (unweighted)
 # ----------------------------------------------------------------------------
 # For each prefix, count how many of the other five it tends to precede
-# (dominance proportion > 0.5). The resulting win count gives a preliminary
-# ranking from most-leftward to most-rightward.
+# (dominance proportion > 0.5). Ties in win count are broken by
+# mean_dominance (the average proportion of leftward appearances across
+# all pairs the prefix participates in).
 
 ranking_scores <- tibble(
   prefix = prefixes,
@@ -725,50 +772,144 @@ ranking_scores <- tibble(
 ) %>%
   arrange(desc(wins), desc(mean_dominance))
 
-cat("\n--- Win-count ranking ---\n")
+cat("\n--- Win-count ranking (unweighted) ---\n")
 print(ranking_scores)
 
 # ----------------------------------------------------------------------------
-# 26. Best-fitting total order (exhaustive search over 6! = 720 rankings)
+# 26. Best-fitting total order: three weighting schemes
 # ----------------------------------------------------------------------------
-# For each of the 720 possible orderings of the six prefixes, compute the
-# proportion of attested pairwise tendencies that are consistent with that
-# ordering (i.e., the higher-ranked prefix also appears leftward more often).
-# The ordering with the highest consistency score is the best-fitting
-# total order.
+# For each of the 720 possible orderings of the six prefixes, a consistency
+# score is computed. The ordering with the highest score is the best-fitting
+# total order under each scheme.
+#
+# Scheme (a): UNWEIGHTED
+#   Score = (number of correctly predicted pair directions) /
+#           (total attested pairs)
+#   Simple but treats all pairs equally.
+#
+# Scheme (b): MAGNITUDE-WEIGHTED
+#   Score = sum of |p - 0.5| for correctly predicted pairs /
+#           sum of |p - 0.5| for all attested pairs
+#   Weight = |p - 0.5|: zero for a 50-50 split (uninformative),
+#   0.5 for a 100-0 split (maximally informative). A pair where one
+#   prefix almost always goes left tells us much more about the
+#   underlying hierarchy than a near-balanced pair.
+#
+# Scheme (c): COMBINED-WEIGHTED (magnitude × token count)
+#   Score = sum of n_ij * |p - 0.5| for correctly predicted pairs /
+#           sum of n_ij * |p - 0.5| for all attested pairs
+#   Rewards both a strong preference AND a reliable estimate of it.
+#   This is the closest non-parametric analog to what Bradley-Terry
+#   maximum likelihood estimation does: a 99-1 split from 88 tokens
+#   contributes far more than a 55-45 split from 3 tokens.
 
 all_rankings <- permn(prefixes)
 
-consistency_scores <- map_dbl(all_rankings, function(ranking) {
-  n_consistent <- 0
-  n_total      <- 0
-  for (i in 1:5) {
-    for (j in (i + 1):6) {
-      left  <- ranking[i]
-      right <- ranking[j]
-      p     <- dom_matrix[left, right]
-      if (!is.na(p)) {
-        n_consistent <- n_consistent + (p > 0.5)
-        n_total      <- n_total + 1
+# --- Helper: compute consistency score under a given weight function ---
+compute_consistency <- function(rankings, dom_mat, token_mat,
+                                weight_fn = "unweighted") {
+  map_dbl(rankings, function(ranking) {
+    w_consistent <- 0
+    w_total      <- 0
+    
+    for (i in 1:5) {
+      for (j in (i + 1):6) {
+        left  <- ranking[i]
+        right <- ranking[j]
+        p     <- dom_mat[left, right]
+        n     <- token_mat[left, right]
+        
+        if (is.na(p)) next
+        
+        w <- switch(weight_fn,
+                    "unweighted" = 1,
+                    "magnitude"  = abs(p - 0.5),
+                    "combined"   = ifelse(is.na(n), 0, n * abs(p - 0.5))
+        )
+        
+        w_total      <- w_total      + w
+        w_consistent <- w_consistent + (p > 0.5) * w
       }
     }
-  }
-  n_consistent / n_total
-})
+    
+    if (w_total == 0) return(NA)
+    w_consistent / w_total
+  })
+}
 
-best_idx         <- which.max(consistency_scores)
-best_ranking     <- all_rankings[[best_idx]]
-best_consistency <- consistency_scores[best_idx]
+# --- Compute scores under all three schemes ---
+scores_unweighted <- compute_consistency(
+  all_rankings, dom_matrix, token_matrix, "unweighted")
+scores_magnitude  <- compute_consistency(
+  all_rankings, dom_matrix, token_matrix, "magnitude")
+scores_combined   <- compute_consistency(
+  all_rankings, dom_matrix, token_matrix, "combined")
 
+# --- Extract best-fitting ranking under each scheme ---
+extract_best <- function(scores, rankings, label) {
+  best_idx     <- which.max(scores)
+  best_ranking <- rankings[[best_idx]]
+  best_score   <- scores[best_idx]
+  n_tied       <- sum(scores == best_score, na.rm = TRUE)
+  
+  cat(sprintf(
+    "\n--- Best-fitting total order (%s) ---\n  %s\n  Score: %.4f\n  Rankings achieving maximum: %d / 720\n",
+    label,
+    paste(best_ranking, collapse = " > "),
+    best_score,
+    n_tied
+  ))
+  
+  list(ranking = best_ranking, score = best_score, n_tied = n_tied)
+}
+
+best_unweighted <- extract_best(scores_unweighted, all_rankings,
+                                "unweighted")
+best_magnitude  <- extract_best(scores_magnitude,  all_rankings,
+                                "magnitude-weighted")
+best_combined   <- extract_best(scores_combined,   all_rankings,
+                                "combined-weighted")
+
+# --- Summary comparison of rankings across schemes ---
+cat("\n--- Ranking stability across weighting schemes ---\n")
+ranking_stability <- tibble(
+  scheme     = c("Unweighted",
+                 "Magnitude-weighted",
+                 "Combined-weighted"),
+  ranking    = c(paste(best_unweighted$ranking, collapse = " > "),
+                 paste(best_magnitude$ranking,  collapse = " > "),
+                 paste(best_combined$ranking,   collapse = " > ")),
+  score      = c(best_unweighted$score,
+                 best_magnitude$score,
+                 best_combined$score),
+  n_tied     = c(best_unweighted$n_tied,
+                 best_magnitude$n_tied,
+                 best_combined$n_tied)
+)
+print(ranking_stability)
+
+# Check whether all three schemes agree on the same ranking
+schemes_agree <- length(unique(ranking_stability$ranking)) == 1
 cat(sprintf(
-  "\nBest-fitting total order:\n  %s\nConsistency: %.1f%% of attested pairs\n",
-  paste(best_ranking, collapse = " > "),
-  100 * best_consistency
+  "\nAll three schemes recover the same ranking: %s\n",
+  ifelse(schemes_agree, "YES -- robust result", "NO -- check disagreements")
 ))
 
-# How many rankings achieve the maximum consistency score?
-n_tied <- sum(consistency_scores == best_consistency)
-cat(sprintf("Rankings achieving maximum consistency: %d / 720\n", n_tied))
+# If they disagree, identify which positions differ
+if (!schemes_agree) {
+  cat("\nPosition-by-position comparison:\n")
+  pos_comparison <- tibble(
+    position   = 1:6,
+    unweighted = best_unweighted$ranking,
+    magnitude  = best_magnitude$ranking,
+    combined   = best_combined$ranking
+  ) %>%
+    mutate(
+      agrees = (unweighted == magnitude) & (magnitude == combined),
+      note   = ifelse(agrees, "stable", "DIFFERS")
+    )
+  print(pos_comparison)
+}
 
 # ----------------------------------------------------------------------------
 # 27. Compare the empirical ranking to CE and PS rankings
@@ -776,6 +917,11 @@ cat(sprintf("Rankings achieving maximum consistency: %d / 720\n", n_tied))
 # Spearman correlations between the empirical win-count ranking and the
 # CE- and PS-derived rankings. Repeated with arci- excluded to assess
 # how much of the misalignment is driven by that prefix alone.
+#
+# Note: rank_PS is computed as rank(ICLOCAL) because lower PS (lower
+# surprisal = more frequent) corresponds to more leftward placement, so
+# the PS rank and the empirical rank should correlate positively when
+# defined this way.
 
 ranking_comparison <- ranking_scores %>%
   left_join(info_measures %>% select(Prefix, ICTRANS_MM, ICLOCAL),
@@ -791,23 +937,51 @@ print(ranking_comparison %>%
         select(prefix, rank_empirical, rank_CE, rank_PS,
                wins, ICTRANS_MM, ICLOCAL))
 
-cat("\n--- Spearman: empirical ranking ~ CE ranking (all prefixes) ---\n")
+cat("\n--- Spearman: empirical ~ CE (all prefixes) ---\n")
 print(cor.test(ranking_comparison$rank_empirical,
                ranking_comparison$rank_CE,
                method = "spearman"))
 
-cat("\n--- Spearman: empirical ranking ~ PS ranking (all prefixes) ---\n")
+cat("\n--- Spearman: empirical ~ PS (all prefixes) ---\n")
 print(cor.test(ranking_comparison$rank_empirical,
                ranking_comparison$rank_PS,
                method = "spearman"))
 
-cat("\n--- Spearman: empirical ranking ~ CE ranking (excluding arci-) ---\n")
+# Without arci-: both correlations should strengthen to ~0.90
 rc_no_arci <- ranking_comparison %>% filter(prefix != "arci")
-cat(sprintf("  rho_CE = %.3f,  rho_PS = %.3f\n",
-            cor(rc_no_arci$rank_empirical,
-                rc_no_arci$rank_CE,   method = "spearman"),
-            cor(rc_no_arci$rank_empirical,
-                rc_no_arci$rank_PS,   method = "spearman")))
+cat("\n--- Spearman: empirical ~ CE and PS (excluding arci-) ---\n")
+cat(sprintf(
+  "  rho_CE = %.3f\n  rho_PS = %.3f\n",
+  cor(rc_no_arci$rank_empirical,
+      rc_no_arci$rank_CE, method = "spearman"),
+  cor(rc_no_arci$rank_empirical,
+      rc_no_arci$rank_PS, method = "spearman")
+))
+
+# ----------------------------------------------------------------------------
+# 28. Per-pair weight summary (diagnostic)
+# ----------------------------------------------------------------------------
+# Shows, for each attested pair, what weight each scheme assigns.
+# Useful for understanding which pairs are driving the weighted rankings
+# and which contribute little (sparse pairs with near-balanced proportions).
+
+weight_summary <- pair_counts %>%
+  mutate(
+    p_left        = prop_A_left,
+    magnitude_w   = abs(p_left - 0.5),
+    combined_w    = n_total * abs(p_left - 0.5),
+    informativeness = case_when(
+      abs(p_left - 0.5) >= 0.30 ~ "high (>80-20 split)",
+      abs(p_left - 0.5) >= 0.15 ~ "moderate (65-35 to 80-20)",
+      TRUE                      ~ "low (<65-35 split)"
+    )
+  ) %>%
+  select(pair, n_total, p_left, magnitude_w, combined_w,
+         informativeness) %>%
+  arrange(desc(combined_w))
+
+cat("\n--- Per-pair weight summary ---\n")
+print(weight_summary, n = Inf)
 
 # ============================================================================
 # PLOTS
